@@ -72,6 +72,8 @@ interface ParsedStartArgs {
 	grillMode?: GrillMode;
 	implementationBackend?: AgentBackend;
 	reviewMode?: AgentBackend | "cross";
+	standardsReviewBackend?: AgentBackend;
+	specReviewBackend?: AgentBackend;
 	goal: string;
 }
 
@@ -96,6 +98,8 @@ function parseStartArgs(raw: string): ParsedStartArgs {
 	let grillMode: GrillMode | undefined;
 	let implementationBackend: AgentBackend | undefined;
 	let reviewMode: AgentBackend | "cross" | undefined;
+	let standardsReviewBackend: AgentBackend | undefined;
+	let specReviewBackend: AgentBackend | undefined;
 
 	for (let index = 0; index < tokens.length; index++) {
 		const token = tokens[index];
@@ -125,12 +129,32 @@ function parseStartArgs(raw: string): ParsedStartArgs {
 				if (!reviewMode) throw new Error(`Invalid --review-with value: ${value ?? "missing"}`);
 				break;
 			}
+			case "--standards-review-with": {
+				const value = inlineValue ?? tokens[++index];
+				standardsReviewBackend = parseBackend(value);
+				if (!standardsReviewBackend) throw new Error(`Invalid --standards-review-with value: ${value ?? "missing"}`);
+				break;
+			}
+			case "--spec-review-with": {
+				const value = inlineValue ?? tokens[++index];
+				specReviewBackend = parseBackend(value);
+				if (!specReviewBackend) throw new Error(`Invalid --spec-review-with value: ${value ?? "missing"}`);
+				break;
+			}
 			default:
 				goal.push(token);
 		}
 	}
 
-	return { route, grillMode, implementationBackend, reviewMode, goal: goal.join(" ").trim() };
+	return {
+		route,
+		grillMode,
+		implementationBackend,
+		reviewMode,
+		standardsReviewBackend,
+		specReviewBackend,
+		goal: goal.join(" ").trim(),
+	};
 }
 
 interface BackendInfo {
@@ -187,14 +211,6 @@ const MATT_PROFILES: Record<string, string> = Object.fromEntries([
 		buildProfile(backend, "reviewer"),
 	]),
 ]);
-
-function profileForImplementation(backend: AgentBackend): string | undefined {
-	return BACKENDS[backend].implementationProfile;
-}
-
-function profileForReview(backend: AgentBackend): string {
-	return BACKENDS[backend].reviewProfile;
-}
 
 function installMattProfiles(): string[] {
 	const profileDir = join(getAgentDir(), "subagents");
@@ -290,7 +306,7 @@ function updateUi(state: FlowState | undefined, ctx: ExtensionContext): void {
 }
 
 function reviewRoutingInstructions(state: FlowState): string {
-	return `When /code-review delegates its two independent axes, use Agent subagent_type "${profileForReview(state.standardsReviewBackend)}" for Standards and "${profileForReview(state.specReviewBackend)}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
+	return `When /code-review delegates its two independent axes, use Agent subagent_type "${BACKENDS[state.standardsReviewBackend].reviewProfile}" for Standards and "${BACKENDS[state.specReviewBackend].reviewProfile}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
 }
 
 function flowInstructions(state: FlowState): string {
@@ -314,14 +330,14 @@ This is controlled by the active Matt flow (${state.flowId}). Use the installed 
 			return `/skill:to-tickets ${state.specRef ?? ""}\n\nAfter the user approves the breakdown and every ticket is published, call matt_flow with action "tickets_created". Supply every created ticket in dependency order with its canonical id/path, title, and blockedBy containing exact ids from the same list. Do not include the parent spec as a ticket.${common}`;
 		case "implement": {
 			if (!ticket) throw new Error("The implementation phase has no active ticket");
-			const implementer = profileForImplementation(state.implementationBackend);
+			const implementer = BACKENDS[state.implementationBackend].implementationProfile;
 			const execution = implementer
 				? `Delegate all implementation edits to Agent subagent_type "${implementer}" with session_key "${state.flowId}-${ticket.id}-implementation". Give the first call a self-contained briefing containing the complete ticket, fixed point ${ticket.baseline}, acceptance criteria, agreed seams, TDD requirement, and focused verification commands; explicitly tell it not to commit or update the tracker yet. The coordinator must inspect the resulting diff and run the independent review axes. Then continue the same session_key with all valid findings (or confirmation that none were found), asking it to fix findings, run the full suite, commit, and update/close the tracker ticket. The coordinator verifies the final diff, commit, tracker state, and clean worktree; it must not duplicate the implementation itself.`
 				: "Implement directly in this fresh Pi coordinator session.";
 			return `/skill:implement ${ticket.id}\n\nImplement only this ticket: ${ticket.title}. Fetch its complete tracker body and comments. ${execution} Its fixed review point is ${ticket.baseline}. Use TDD at the agreed seams, run focused checks regularly, then the full suite. ${reviewRoutingInstructions(state)} Run /code-review against ${ticket.baseline}, fix every valid Standards and Spec finding, and re-check. Commit the finished work, close/update the ticket in the configured tracker so blockers can advance, ensure the worktree is clean, then call matt_flow with action "ticket_implemented", ticketId "${ticket.id}", and commitSha set to HEAD. Do not begin another ticket in this session.${common}`;
 		}
 		case "review": {
-			const implementer = profileForImplementation(state.implementationBackend);
+			const implementer = BACKENDS[state.implementationBackend].implementationProfile;
 			const fixes = implementer
 				? `Delegate integration fixes to Agent subagent_type "${implementer}" with session_key "${state.flowId}-integration-fixes", then verify its diff and commits.`
 				: "Apply integration fixes directly in this coordinator session.";
@@ -639,7 +655,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			if (!goal && ctx.hasUI) goal = (await ctx.ui.editor("What idea should this flow take to shipped code?", ""))?.trim() ?? "";
 			if (!goal) {
 				ctx.ui.notify(
-					"Usage: /matt-flow [--main|--wayfinder] [--docs|--grill-me] [--implement-with pi|codex|claude] [--review-with pi|codex|claude|cross] <idea>",
+					"Usage: /matt-flow [--main|--wayfinder] [--docs|--grill-me] [--implement-with pi|codex|claude] [--review-with pi|codex|claude|cross] [--standards-review-with pi|codex|claude] [--spec-review-with pi|codex|claude] <idea>",
 					"warning",
 				);
 				return;
@@ -681,7 +697,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			implementationBackend ??= "pi";
 
 			let reviewMode = parsed.reviewMode;
-			if (!reviewMode && ctx.hasUI) {
+			if (!reviewMode && !parsed.standardsReviewBackend && !parsed.specReviewBackend && ctx.hasUI) {
 				const options: Array<[AgentBackend | "cross", string]> = [
 					["cross", "Cross review — Codex for Standards, Claude for Spec (recommended)"],
 					["pi", "Pi subagents — Pi for both axes"],
@@ -693,8 +709,13 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				reviewMode = options.find(([, label]) => label === choice)?.[0];
 			}
 			reviewMode ??= "pi";
-			const standardsReviewBackend: AgentBackend = reviewMode === "cross" ? "codex" : reviewMode;
-			const specReviewBackend: AgentBackend = reviewMode === "cross" ? "claude" : reviewMode;
+			const standardsReviewBackend: AgentBackend = parsed.standardsReviewBackend ?? (reviewMode === "cross" ? "codex" : reviewMode);
+			const specReviewBackend: AgentBackend = parsed.specReviewBackend ?? (reviewMode === "cross" ? "claude" : reviewMode);
+
+			const installedProfiles = installMattProfiles();
+			if (installedProfiles.length > 0) {
+				ctx.ui.notify(`Installed pi-flow profiles: ${installedProfiles.join(", ")}`, "info");
+			}
 
 			const externalBackends = new Set(
 				[implementationBackend, standardsReviewBackend, specReviewBackend].filter(
@@ -710,10 +731,6 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				}
 			}
 			if (externalBackends.size > 0) {
-				const installedProfiles = installMattProfiles();
-				if (installedProfiles.length > 0) {
-					ctx.ui.notify(`Installed pi-flow profiles: ${installedProfiles.join(", ")}`, "info");
-				}
 				ctx.ui.notify(
 					"External pi-flow backends bypass normal approval/sandbox prompts. Continue only in a trusted repository.",
 					"warning",
@@ -729,7 +746,8 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			const candidate = { route, grillMode };
 			const missing = requiredSkills(candidate).filter((skill) => !skillIsAvailable(pi, skill));
 			if (missing.length > 0) {
-				ctx.ui.notify(`Missing required skills: ${missing.join(", ")}`, "error");
+				const researchHint = missing.includes("research") ? " Run /matt-flow-install-research to install it globally." : "";
+				ctx.ui.notify(`Missing required skills: ${missing.join(", ")}.${researchHint}`, "error");
 				return;
 			}
 
@@ -757,8 +775,27 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		},
 	});
 
+	pi.registerCommand("matt-flow-install-research", {
+		description: "Install Matt Pocock's research skill globally and reload pi resources",
+		handler: async (_args, ctx) => {
+			ctx.ui.notify("Installing Matt's research skill…", "info");
+			const result = await pi.exec(
+				"npx",
+				["--yes", "skills", "add", "mattpocock/skills", "--global", "--skill", "research", "--agent", "*", "--yes"],
+				{ timeout: 120_000 },
+			);
+			if (result.code !== 0) {
+				ctx.ui.notify(result.stderr.trim() || "Research skill installation failed", "error");
+				return;
+			}
+			ctx.ui.notify("Research skill installed; reloading pi resources", "info");
+			await ctx.reload();
+			return;
+		},
+	});
+
 	pi.registerCommand("matt-flow-install-profiles", {
-		description: "Install the bundled Codex and Claude pi-flow profiles without overwriting existing profiles",
+		description: "Install the bundled Pi, Codex, and Claude pi-flow profiles without overwriting existing profiles",
 		handler: async (_args, ctx) => {
 			const installed = installMattProfiles();
 			ctx.ui.notify(
@@ -818,9 +855,12 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		if (event.toolName !== "Agent") return;
 		const subagentType = (event.input as { subagent_type?: unknown }).subagent_type;
 		if (!Object.values(BACKENDS).some((backend) => backend.reviewProfile === subagentType)) return;
+		const rootResult = await pi.exec("git", ["-C", ctx.cwd, "rev-parse", "--show-toplevel"]);
+		if (rootResult.code !== 0) throw new Error(rootResult.stderr || "Unable to resolve the review repository root");
+		const repoRoot = rootResult.stdout.trim();
 		reviewWorktreeFingerprints.set(event.toolCallId, {
-			cwd: ctx.cwd,
-			fingerprint: await fingerprintWorktree(ctx.cwd),
+			cwd: repoRoot,
+			fingerprint: await fingerprintWorktree(repoRoot),
 		});
 	});
 

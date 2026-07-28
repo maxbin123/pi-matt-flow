@@ -20,6 +20,14 @@ Then restart pi, or run `/reload` in an existing process.
 
 Install [Matt Pocock's skills](https://github.com/mattpocock/skills), including `setup-matt-pocock-skills`, `grill-with-docs` or `grill-me`, `to-spec`, `to-tickets`, `implement`, and `code-review`. The `wayfinder` route additionally requires `wayfinder` and `research`.
 
+If `research` is missing, install it from inside pi with:
+
+```text
+/matt-flow-install-research
+```
+
+This runs the global `skills add mattpocock/skills --skill research` flow and reloads pi resources.
+
 `@kky42/pi-flow` is bundled by this package. Do not install a second standalone copy, because both copies would register the `Agent` tool.
 
 For external backends, install and authenticate the corresponding CLI:
@@ -65,6 +73,8 @@ The implementation ticket's fixed point is captured immediately before its fresh
 - `/matt-flow-status` — show phase and captured tracker ids
 - `/matt-flow-resume` — resume a paused flow
 - `/matt-flow-cancel` — cancel orchestration without changing git/tracker artifacts
+- `/matt-flow-install-research` — globally install Matt's missing `research` skill and reload
+- `/matt-flow-install-profiles` — install bundled pi-flow profiles without overwriting custom files
 - `/matt-flow-advance` — internal session-transition command
 
 Flags:
@@ -73,8 +83,10 @@ Flags:
 - `--docs` / `--grill-me`
 - `--implement-with pi|codex|claude`
 - `--review-with pi|codex|claude|cross`
+- `--standards-review-with pi|codex|claude`
+- `--spec-review-with pi|codex|claude`
 
-`cross` assigns Standards review to Codex and Spec review to Claude. Without flags, the interactive command asks for both choices.
+`cross` assigns Standards review to Codex and Spec review to Claude. The per-axis flags override that shorthand, so the direction can be reversed or mixed arbitrarily. Without flags, the interactive command asks for both choices.
 
 ## pi-flow integration
 
