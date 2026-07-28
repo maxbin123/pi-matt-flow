@@ -7,7 +7,11 @@ A pi package that turns Matt Pocock's engineering skills into a resumable idea-t
 Review the source first: pi extensions run with your full system permissions.
 
 ```bash
+# Follow the default branch
 pi install git:github.com/maxbin123/pi-matt-flow
+
+# Or pin the first release
+pi install git:github.com/maxbin123/pi-matt-flow@v0.1.0
 ```
 
 Then restart pi, or run `/reload` in an existing process.
