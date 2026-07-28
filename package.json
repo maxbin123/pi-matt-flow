@@ -1,0 +1,33 @@
+{
+  "name": "pi-matt-flow",
+  "version": "0.1.0",
+  "description": "A resumable idea-to-ship workflow for pi using Matt Pocock's engineering skills",
+  "type": "module",
+  "license": "MIT",
+  "author": "Max",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maxbin123/pi-matt-flow.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "workflow",
+    "agent-skills",
+    "tdd",
+    "code-review"
+  ],
+  "scripts": {
+    "check": "pi --offline --no-extensions -e ./extensions/matt-flow/index.ts --list-models >/dev/null"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/matt-flow/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}
