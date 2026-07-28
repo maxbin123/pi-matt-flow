@@ -52,6 +52,7 @@ interface FlowState {
 	implementationBackend: AgentBackend;
 	standardsReviewBackend: AgentBackend;
 	specReviewBackend: AgentBackend;
+	crossReview: boolean;
 	phase: Phase;
 	resumePhase?: Exclude<Phase, "paused" | "done" | "cancelled">;
 	baseRef: string;
@@ -261,7 +262,9 @@ function formatState(state: FlowState): string {
 		`Route: ${state.route}`,
 		`Goal: ${state.goal}`,
 		`Implementation: ${state.implementationBackend}`,
-		`Review: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`,
+		state.crossReview
+			? "Review: four-way cross review (Codex + Claude on both axes)"
+			: `Review: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`,
 	];
 	if (state.mapRef) lines.push(`Map: ${state.mapRef}`);
 	if (state.specRef) lines.push(`Spec: ${state.specRef}`);
@@ -306,6 +309,9 @@ function updateUi(state: FlowState | undefined, ctx: ExtensionContext): void {
 }
 
 function reviewRoutingInstructions(state: FlowState): string {
+	if (state.crossReview) {
+		return `When /code-review delegates review work, launch four independent Agent calls in the same assistant response: Standards with subagent_type "${BACKENDS.codex.reviewProfile}", Standards with "${BACKENDS.claude.reviewProfile}", Spec with "${BACKENDS.codex.reviewProfile}", and Spec with "${BACKENDS.claude.reviewProfile}". Omit session_key for all four so their contexts remain fresh and isolated. Aggregate under the original Standards and Spec headings, with Codex and Claude subheadings inside each axis; do not merge, deduplicate, or rerank one backend's findings over the other.`;
+	}
 	return `When /code-review delegates its two independent axes, use Agent subagent_type "${BACKENDS[state.standardsReviewBackend].reviewProfile}" for Standards and "${BACKENDS[state.specReviewBackend].reviewProfile}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
 }
 
@@ -356,7 +362,7 @@ Current phase: ${state.phase}
 Route: ${state.route}
 Goal: ${state.goal}
 Implementation backend: ${state.implementationBackend}
-Review backends: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}
+Review backends: ${state.crossReview ? "Codex + Claude independently on both Standards and Spec" : `Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`}
 ${state.specRef ? `Spec: ${state.specRef}\n` : ""}${ticket ? `Active ticket: ${ticket.id} — ${ticket.title}\nTicket fixed point: ${ticket.baseline}\n` : ""}
 Rules:
 - Follow the current Matt skill and all of its user-confirmation gates.
@@ -398,6 +404,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				implementationBackend: restored.implementationBackend ?? "pi",
 				standardsReviewBackend: restored.standardsReviewBackend ?? "pi",
 				specReviewBackend: restored.specReviewBackend ?? "pi",
+				crossReview: restored.crossReview ?? false,
 			};
 		} else {
 			state = undefined;
@@ -699,7 +706,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			let reviewMode = parsed.reviewMode;
 			if (!reviewMode && !parsed.standardsReviewBackend && !parsed.specReviewBackend && ctx.hasUI) {
 				const options: Array<[AgentBackend | "cross", string]> = [
-					["cross", "Cross review — Codex for Standards, Claude for Spec (recommended)"],
+					["cross", "Four-way cross review — Codex and Claude independently review both axes (recommended)"],
 					["pi", "Pi subagents — Pi for both axes"],
 					["codex", "Codex CLI — Codex for both axes"],
 					["claude", "Claude Code — Claude for both axes"],
@@ -709,6 +716,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				reviewMode = options.find(([, label]) => label === choice)?.[0];
 			}
 			reviewMode ??= "pi";
+			const crossReview = reviewMode === "cross" && !parsed.standardsReviewBackend && !parsed.specReviewBackend;
 			const standardsReviewBackend: AgentBackend = parsed.standardsReviewBackend ?? (reviewMode === "cross" ? "codex" : reviewMode);
 			const specReviewBackend: AgentBackend = parsed.specReviewBackend ?? (reviewMode === "cross" ? "claude" : reviewMode);
 
@@ -763,6 +771,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				implementationBackend,
 				standardsReviewBackend,
 				specReviewBackend,
+				crossReview,
 				phase: setupExists ? (route === "wayfinder" ? "wayfinder-chart" : "grill") : "setup",
 				baseRef: headResult.stdout.trim(),
 				tickets: [],

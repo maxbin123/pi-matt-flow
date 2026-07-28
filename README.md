@@ -62,7 +62,7 @@ The extension follows `ask-matt` and `wayfinder` context hygiene:
 - Every implementation ticket starts in a **new pi session** and receives only the durable workflow state and that ticket's tracker id.
 - Every Wayfinder decision ticket starts in a **new pi session**; no session resolves more than one.
 - The final integration review starts in a **new pi session**.
-- Each Standards/Spec review axis runs as a separate fresh pi-flow `Agent` call with no `session_key`, so the axes remain isolated.
+- In four-way cross review, both Standards and Spec are independently reviewed by Codex and Claude: four fresh pi-flow `Agent` calls with no `session_key`.
 - A Codex or Claude implementation agent gets a stable per-ticket `session_key`; review fixes continue that same specialist context without contaminating independent review contexts.
 
 The implementation ticket's fixed point is captured immediately before its fresh session. The final review fixed point is the commit at which `/matt-flow` started.
@@ -86,7 +86,7 @@ Flags:
 - `--standards-review-with pi|codex|claude`
 - `--spec-review-with pi|codex|claude`
 
-`cross` assigns Standards review to Codex and Spec review to Claude. The per-axis flags override that shorthand, so the direction can be reversed or mixed arbitrarily. Without flags, the interactive command asks for both choices.
+`cross` launches four fresh reviewers in parallel: Codex Standards, Claude Standards, Codex Spec, and Claude Spec. Results remain separated first by axis and then by backend—Matt Flow does not merge or rerank one backend over the other. The per-axis flags select a narrower two-reviewer arrangement instead. Without flags, the interactive command asks for both choices.
 
 ## pi-flow integration
 
