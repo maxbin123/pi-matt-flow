@@ -92,7 +92,7 @@ Flags:
 
 Matt Flow owns the phase state machine and interactive fresh-session boundaries. pi-flow owns the subagent seam: profiles, Pi/Codex/Claude spawning, bounded concurrency, cancellation, telemetry, rendering, and `session_key` continuation.
 
-When an external backend is selected, Matt Flow installs these profiles under `~/.pi/agent/subagents/` if they are missing, without overwriting existing files:
+Matt Flow installs these dedicated profiles under `~/.pi/agent/subagents/` and refreshes their exact contents before a flow starts. These names are reserved by Matt Flow so backend and read-only-role guarantees cannot be bypassed by stale or colliding profile files:
 
 - `matt-pi-reviewer`
 - `matt-codex-implementer`
@@ -100,11 +100,11 @@ When an external backend is selected, Matt Flow installs these profiles under `~
 - `matt-codex-reviewer`
 - `matt-claude-reviewer`
 
-Run `/matt-flow-install-profiles` to install them explicitly.
+Run `/matt-flow-install-profiles` to install or refresh them explicitly.
 
 Matt Flow deliberately disables pi-flow's dynamic `workflow` tool. Its main flow contains human gates and cross-session transitions, while direct parallel `Agent` calls already provide the fresh-context implementation and review delegation it needs.
 
-> **Security:** pi-flow runs Codex and Claude external backends with their approval/sandbox checks bypassed. Use external implementation agents only in repositories you trust. Review profiles are instructed to remain read-only, and Matt Flow fingerprints the worktree before and after review calls so an attempted review mutation fails the tool call, but the external CLIs still run with privileged access.
+> **Security:** pi-flow runs Codex and Claude external backends with their approval/sandbox checks bypassed. Interactive startup requires a blocking confirmation before enabling them. Use external implementation agents only in repositories you trust. Review profiles are instructed to remain read-only, and Matt Flow fingerprints HEAD plus tracked and non-ignored untracked repository state before and after review calls so a detected review mutation fails the tool call. Ignored paths are deliberately excluded to avoid hashing dependency/build caches; the external CLIs still run with privileged access.
 
 ## Milestone tool
 

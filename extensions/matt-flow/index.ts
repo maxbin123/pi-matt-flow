@@ -18,6 +18,9 @@ const WIDGET_KEY = "matt-flow-tickets";
 type Route = "main" | "wayfinder";
 type GrillMode = "grill-with-docs" | "grill-me";
 type AgentBackend = "pi" | "codex" | "claude";
+type ReviewRouting =
+	| { mode: "cross" }
+	| { mode: "paired"; standardsBackend: AgentBackend; specBackend: AgentBackend };
 type Phase =
 	| "setup"
 	| "grill"
@@ -50,9 +53,7 @@ interface FlowState {
 	route: Route;
 	grillMode: GrillMode;
 	implementationBackend: AgentBackend;
-	standardsReviewBackend: AgentBackend;
-	specReviewBackend: AgentBackend;
-	crossReview: boolean;
+	reviewRouting: ReviewRouting;
 	phase: Phase;
 	resumePhase?: Exclude<Phase, "paused" | "done" | "cancelled">;
 	baseRef: string;
@@ -186,6 +187,15 @@ const BACKENDS: Record<AgentBackend, BackendInfo> = {
 	},
 };
 
+const CROSS_REVIEW_LANES = [
+	{ key: "standards-codex", description: "Standards / Codex", profile: "matt-codex-reviewer" },
+	{ key: "standards-claude", description: "Standards / Claude", profile: "matt-claude-reviewer" },
+	{ key: "spec-codex", description: "Spec / Codex", profile: "matt-codex-reviewer" },
+	{ key: "spec-claude", description: "Spec / Claude", profile: "matt-claude-reviewer" },
+] as const;
+
+type CrossReviewLaneKey = (typeof CROSS_REVIEW_LANES)[number]["key"];
+
 const IMPLEMENTER_ROLE = "You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.";
 const REVIEWER_ROLE = "Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.";
 
@@ -216,14 +226,16 @@ const MATT_PROFILES: Record<string, string> = Object.fromEntries([
 function installMattProfiles(): string[] {
 	const profileDir = join(getAgentDir(), "subagents");
 	mkdirSync(profileDir, { recursive: true });
-	const installed: string[] = [];
+	const updated: string[] = [];
 	for (const [name, content] of Object.entries(MATT_PROFILES)) {
 		const path = join(profileDir, `${name}.md`);
-		if (existsSync(path)) continue;
-		writeFileSync(path, `${content.trim()}\n`, "utf8");
-		installed.push(name);
+		const expected = `${content.trim()}\n`;
+		const current = existsSync(path) ? readFileSync(path, "utf8") : undefined;
+		if (current === expected) continue;
+		writeFileSync(path, expected, "utf8");
+		updated.push(name);
 	}
-	return installed;
+	return updated;
 }
 
 function requiredSkills(state: Pick<FlowState, "route" | "grillMode">): string[] {
@@ -262,9 +274,9 @@ function formatState(state: FlowState): string {
 		`Route: ${state.route}`,
 		`Goal: ${state.goal}`,
 		`Implementation: ${state.implementationBackend}`,
-		state.crossReview
+		state.reviewRouting.mode === "cross"
 			? "Review: four-way cross review (Codex + Claude on both axes)"
-			: `Review: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`,
+			: `Review: Standards=${state.reviewRouting.standardsBackend}, Spec=${state.reviewRouting.specBackend}`,
 	];
 	if (state.mapRef) lines.push(`Map: ${state.mapRef}`);
 	if (state.specRef) lines.push(`Spec: ${state.specRef}`);
@@ -309,10 +321,10 @@ function updateUi(state: FlowState | undefined, ctx: ExtensionContext): void {
 }
 
 function reviewRoutingInstructions(state: FlowState): string {
-	if (state.crossReview) {
-		return `When /code-review delegates review work, launch four independent Agent calls in the same assistant response: Standards with subagent_type "${BACKENDS.codex.reviewProfile}", Standards with "${BACKENDS.claude.reviewProfile}", Spec with "${BACKENDS.codex.reviewProfile}", and Spec with "${BACKENDS.claude.reviewProfile}". Omit session_key for all four so their contexts remain fresh and isolated. Aggregate under the original Standards and Spec headings, with Codex and Claude subheadings inside each axis; do not merge, deduplicate, or rerank one backend's findings over the other.`;
+	if (state.reviewRouting.mode === "cross") {
+		return `When /code-review delegates review work, launch exactly four independent Agent calls in the same assistant response with these exact description/subagent_type pairs: "Standards / Codex" → "${BACKENDS.codex.reviewProfile}", "Standards / Claude" → "${BACKENDS.claude.reviewProfile}", "Spec / Codex" → "${BACKENDS.codex.reviewProfile}", and "Spec / Claude" → "${BACKENDS.claude.reviewProfile}". Omit session_key for all four so their contexts remain fresh and isolated. Matt Flow validates this four-call batch before execution. Aggregate under the original Standards and Spec headings, with Codex and Claude subheadings inside each axis; do not merge, deduplicate, or rerank one backend's findings over the other.`;
 	}
-	return `When /code-review delegates its two independent axes, use Agent subagent_type "${BACKENDS[state.standardsReviewBackend].reviewProfile}" for Standards and "${BACKENDS[state.specReviewBackend].reviewProfile}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
+	return `When /code-review delegates its two independent axes, use Agent subagent_type "${BACKENDS[state.reviewRouting.standardsBackend].reviewProfile}" for Standards and "${BACKENDS[state.reviewRouting.specBackend].reviewProfile}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
 }
 
 function flowInstructions(state: FlowState): string {
@@ -362,7 +374,7 @@ Current phase: ${state.phase}
 Route: ${state.route}
 Goal: ${state.goal}
 Implementation backend: ${state.implementationBackend}
-Review backends: ${state.crossReview ? "Codex + Claude independently on both Standards and Spec" : `Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`}
+Review backends: ${state.reviewRouting.mode === "cross" ? "Codex + Claude independently on both Standards and Spec" : `Standards=${state.reviewRouting.standardsBackend}, Spec=${state.reviewRouting.specBackend}`}
 ${state.specRef ? `Spec: ${state.specRef}\n` : ""}${ticket ? `Active ticket: ${ticket.id} — ${ticket.title}\nTicket fixed point: ${ticket.baseline}\n` : ""}
 Rules:
 - Follow the current Matt skill and all of its user-confirmation gates.
@@ -383,6 +395,8 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 
 	let state: FlowState | undefined;
 	const reviewWorktreeFingerprints = new Map<string, { cwd: string; fingerprint: string }>();
+	const reviewCallLanes = new Map<string, CrossReviewLaneKey>();
+	const completedCrossReviewLanes = new Set<CrossReviewLaneKey>();
 
 	const persist = (ctx?: ExtensionContext) => {
 		if (!state) return;
@@ -398,13 +412,22 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			.pop() as { data?: FlowState } | undefined;
 		if (entry?.data) {
 			const restored = cloneState(entry.data);
+			const legacy = restored as FlowState & {
+				standardsReviewBackend?: AgentBackend;
+				specReviewBackend?: AgentBackend;
+				crossReview?: boolean;
+			};
 			state = {
 				...restored,
 				version: 2,
 				implementationBackend: restored.implementationBackend ?? "pi",
-				standardsReviewBackend: restored.standardsReviewBackend ?? "pi",
-				specReviewBackend: restored.specReviewBackend ?? "pi",
-				crossReview: restored.crossReview ?? false,
+				reviewRouting: restored.reviewRouting ?? (legacy.crossReview
+					? { mode: "cross" }
+					: {
+							mode: "paired",
+							standardsBackend: legacy.standardsReviewBackend ?? "pi",
+							specBackend: legacy.specReviewBackend ?? "pi",
+						}),
 			};
 		} else {
 			state = undefined;
@@ -457,6 +480,14 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			}
 		}
 		return hash.digest("hex");
+	};
+
+	const assertCrossReviewCompleted = (): void => {
+		if (state?.reviewRouting.mode !== "cross") return;
+		const missing = CROSS_REVIEW_LANES.filter((lane) => !completedCrossReviewLanes.has(lane.key));
+		if (missing.length > 0) {
+			throw new Error(`Four-way cross review is incomplete. Missing: ${missing.map((lane) => lane.description).join(", ")}`);
+		}
 	};
 
 	const startFreshPhase = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -582,6 +613,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 					const active = ticketById(state, state.activeTicketId);
 					if (!active) throw new Error("There is no active ticket");
 					if (params.ticketId !== active.id) throw new Error(`Expected active ticket ${active.id}, received ${params.ticketId ?? "none"}`);
+					assertCrossReviewCompleted();
 					await assertCleanWorktree(ctx);
 					const head = await resolveHead();
 					if (params.commitSha && params.commitSha !== head) throw new Error(`commitSha ${params.commitSha} is not current HEAD ${head}`);
@@ -612,6 +644,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 
 				case "review_complete":
 					if (state.phase !== "review") throw new Error(`review_complete is not valid during ${state.phase}`);
+					assertCrossReviewCompleted();
 					await assertCleanWorktree(ctx);
 					state.phase = "done";
 					persist(ctx);
@@ -716,17 +749,24 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				reviewMode = options.find(([, label]) => label === choice)?.[0];
 			}
 			reviewMode ??= "pi";
-			const crossReview = reviewMode === "cross" && !parsed.standardsReviewBackend && !parsed.specReviewBackend;
-			const standardsReviewBackend: AgentBackend = parsed.standardsReviewBackend ?? (reviewMode === "cross" ? "codex" : reviewMode);
-			const specReviewBackend: AgentBackend = parsed.specReviewBackend ?? (reviewMode === "cross" ? "claude" : reviewMode);
+			const reviewRouting: ReviewRouting = reviewMode === "cross" && !parsed.standardsReviewBackend && !parsed.specReviewBackend
+				? { mode: "cross" }
+				: {
+						mode: "paired",
+						standardsBackend: parsed.standardsReviewBackend ?? (reviewMode === "cross" ? "codex" : reviewMode),
+						specBackend: parsed.specReviewBackend ?? (reviewMode === "cross" ? "claude" : reviewMode),
+					};
 
 			const installedProfiles = installMattProfiles();
 			if (installedProfiles.length > 0) {
-				ctx.ui.notify(`Installed pi-flow profiles: ${installedProfiles.join(", ")}`, "info");
+				ctx.ui.notify(`Installed/refreshed pi-flow profiles: ${installedProfiles.join(", ")}`, "info");
 			}
 
+			const reviewBackends: AgentBackend[] = reviewRouting.mode === "cross"
+				? ["codex", "claude"]
+				: [reviewRouting.standardsBackend, reviewRouting.specBackend];
 			const externalBackends = new Set(
-				[implementationBackend, standardsReviewBackend, specReviewBackend].filter(
+				[implementationBackend, ...reviewBackends].filter(
 					(backend): backend is Exclude<AgentBackend, "pi"> => backend !== "pi",
 				),
 			);
@@ -739,6 +779,14 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				}
 			}
 			if (externalBackends.size > 0) {
+				const backendLabels = [...externalBackends].map((backend) => BACKENDS[backend].label).join(" and ");
+				if (ctx.hasUI) {
+					const approved = await ctx.ui.confirm(
+						"Allow privileged external agents?",
+						`${backendLabels} will run through pi-flow with normal CLI approval/sandbox prompts bypassed. Only continue if ${repoRoot} is trusted.`,
+					);
+					if (!approved) return;
+				}
 				ctx.ui.notify(
 					"External pi-flow backends bypass normal approval/sandbox prompts. Continue only in a trusted repository.",
 					"warning",
@@ -769,9 +817,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				route,
 				grillMode,
 				implementationBackend,
-				standardsReviewBackend,
-				specReviewBackend,
-				crossReview,
+				reviewRouting,
 				phase: setupExists ? (route === "wayfinder" ? "wayfinder-chart" : "grill") : "setup",
 				baseRef: headResult.stdout.trim(),
 				tickets: [],
@@ -804,11 +850,11 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.registerCommand("matt-flow-install-profiles", {
-		description: "Install the bundled Pi, Codex, and Claude pi-flow profiles without overwriting existing profiles",
+		description: "Install or refresh the dedicated Matt Flow Pi, Codex, and Claude profiles",
 		handler: async (_args, ctx) => {
 			const installed = installMattProfiles();
 			ctx.ui.notify(
-				installed.length > 0 ? `Installed pi-flow profiles: ${installed.join(", ")}` : "Matt pi-flow profiles are already installed",
+				installed.length > 0 ? `Installed/refreshed pi-flow profiles: ${installed.join(", ")}` : "Matt pi-flow profiles are already current",
 				"info",
 			);
 		},
@@ -862,8 +908,44 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 
 	pi.on("tool_call", async (event, ctx) => {
 		if (event.toolName !== "Agent") return;
-		const subagentType = (event.input as { subagent_type?: unknown }).subagent_type;
+		const input = event.input as { description?: unknown; subagent_type?: unknown; session_key?: unknown };
+		const subagentType = input.subagent_type;
 		if (!Object.values(BACKENDS).some((backend) => backend.reviewProfile === subagentType)) return;
+		if (input.session_key !== undefined) {
+			return { block: true, reason: "Review Agent calls must omit session_key so every review context is fresh." };
+		}
+
+		if (state?.reviewRouting.mode === "cross") {
+			const assistantEntry = [...ctx.sessionManager.getBranch()].reverse().find(
+				(entry) => entry.type === "message" && entry.message.role === "assistant" && entry.message.content.some(
+					(part) => part.type === "toolCall" && part.id === event.toolCallId,
+				),
+			);
+			const calls = assistantEntry?.type === "message" && assistantEntry.message.role === "assistant"
+				? assistantEntry.message.content.flatMap((part) =>
+						part.type === "toolCall" && part.name === "Agent"
+							? [part.arguments as { description?: unknown; subagent_type?: unknown; session_key?: unknown }]
+							: [],
+					)
+				: [];
+			const batchIsValid = calls.length === CROSS_REVIEW_LANES.length && CROSS_REVIEW_LANES.every(
+				(lane) => calls.filter(
+					(call) => call.description === lane.description && call.subagent_type === lane.profile && call.session_key === undefined,
+				).length === 1,
+			);
+			if (!batchIsValid) {
+				return {
+					block: true,
+					reason: `Four-way cross review must be one four-Agent batch with exact lanes: ${CROSS_REVIEW_LANES.map((lane) => `${lane.description} → ${lane.profile}`).join(", ")}.`,
+				};
+			}
+			const lane = CROSS_REVIEW_LANES.find(
+				(candidate) => candidate.description === input.description && candidate.profile === subagentType,
+			);
+			if (!lane) return { block: true, reason: "This reviewer does not match a required cross-review lane." };
+			reviewCallLanes.set(event.toolCallId, lane.key);
+		}
+
 		const rootResult = await pi.exec("git", ["-C", ctx.cwd, "rev-parse", "--show-toplevel"]);
 		if (rootResult.code !== 0) throw new Error(rootResult.stderr || "Unable to resolve the review repository root");
 		const repoRoot = rootResult.stdout.trim();
@@ -878,17 +960,23 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		if (!baseline) return;
 		reviewWorktreeFingerprints.delete(event.toolCallId);
 		const current = await fingerprintWorktree(baseline.cwd);
-		if (current === baseline.fingerprint) return;
-		return {
-			content: [
-				...event.content,
-				{
-					type: "text" as const,
-					text: "REVIEW SAFETY FAILURE: the worktree changed during this read-only review. Inspect and restore or intentionally incorporate the changes before advancing the Matt flow.",
-				},
-			],
-			isError: true,
-		};
+		if (current !== baseline.fingerprint) {
+			reviewCallLanes.delete(event.toolCallId);
+			return {
+				content: [
+					...event.content,
+					{
+						type: "text" as const,
+						text: "REVIEW SAFETY FAILURE: tracked or non-ignored untracked repository state changed during this read-only review. Inspect and restore or intentionally incorporate the changes before advancing the Matt flow.",
+					},
+				],
+				isError: true,
+			};
+		}
+		const lane = reviewCallLanes.get(event.toolCallId);
+		reviewCallLanes.delete(event.toolCallId);
+		const details = event.details as { status?: unknown } | undefined;
+		if (lane && !event.isError && details?.status === "done") completedCrossReviewLanes.add(lane);
 	});
 
 	pi.on("before_agent_start", async (event) => {
