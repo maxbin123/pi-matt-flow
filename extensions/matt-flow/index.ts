@@ -1,10 +1,11 @@
-import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { basename, join } from "node:path";
-import type {
-	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionContext,
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { createFlowExtension } from "@kky42/pi-flow";
+import {
+	getAgentDir,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
@@ -12,10 +13,10 @@ import { Type } from "typebox";
 const STATE_ENTRY = "matt-flow-state";
 const STATUS_KEY = "matt-flow";
 const WIDGET_KEY = "matt-flow-tickets";
-const MAX_AGENT_OUTPUT_BYTES = 50 * 1024;
 
 type Route = "main" | "wayfinder";
 type GrillMode = "grill-with-docs" | "grill-me";
+type AgentBackend = "pi" | "codex" | "claude";
 type Phase =
 	| "setup"
 	| "grill"
@@ -41,12 +42,15 @@ interface Ticket {
 }
 
 interface FlowState {
-	version: 1;
+	version: 2;
 	flowId: string;
 	goal: string;
 	repoRoot: string;
 	route: Route;
 	grillMode: GrillMode;
+	implementationBackend: AgentBackend;
+	standardsReviewBackend: AgentBackend;
+	specReviewBackend: AgentBackend;
 	phase: Phase;
 	resumePhase?: Exclude<Phase, "paused" | "done" | "cancelled">;
 	baseRef: string;
@@ -65,6 +69,8 @@ interface FlowToolDetails {
 interface ParsedStartArgs {
 	route?: Route;
 	grillMode?: GrillMode;
+	implementationBackend?: AgentBackend;
+	reviewMode?: AgentBackend | "cross";
 	goal: string;
 }
 
@@ -76,15 +82,24 @@ function phaseLabel(phase: Phase): string {
 	return phase.replaceAll("-", " ");
 }
 
+function parseBackend(value: string | undefined): AgentBackend | undefined {
+	return value === "pi" || value === "codex" || value === "claude" ? value : undefined;
+}
+
 function parseStartArgs(raw: string): ParsedStartArgs {
-	const tokens = raw.match(/"[^"]*"|'[^']*'|\S+/g) ?? [];
+	const tokens = (raw.match(/"[^"]*"|'[^']*'|\S+/g) ?? []).map((token) =>
+		token.replace(/^("|')|("|')$/g, ""),
+	);
 	const goal: string[] = [];
 	let route: Route | undefined;
 	let grillMode: GrillMode | undefined;
+	let implementationBackend: AgentBackend | undefined;
+	let reviewMode: AgentBackend | "cross" | undefined;
 
-	for (const rawToken of tokens) {
-		const token = rawToken.replace(/^("|')|("|')$/g, "");
-		switch (token) {
+	for (let index = 0; index < tokens.length; index++) {
+		const token = tokens[index];
+		const [flag, inlineValue] = token.split("=", 2);
+		switch (flag) {
 			case "--wayfinder":
 				route = "wayfinder";
 				break;
@@ -97,12 +112,74 @@ function parseStartArgs(raw: string): ParsedStartArgs {
 			case "--grill-me":
 				grillMode = "grill-me";
 				break;
+			case "--implement-with": {
+				const value = inlineValue ?? tokens[++index];
+				implementationBackend = parseBackend(value);
+				if (!implementationBackend) throw new Error(`Invalid --implement-with value: ${value ?? "missing"}`);
+				break;
+			}
+			case "--review-with": {
+				const value = inlineValue ?? tokens[++index];
+				reviewMode = value === "cross" ? "cross" : parseBackend(value);
+				if (!reviewMode) throw new Error(`Invalid --review-with value: ${value ?? "missing"}`);
+				break;
+			}
 			default:
 				goal.push(token);
 		}
 	}
 
-	return { route, grillMode, goal: goal.join(" ").trim() };
+	return { route, grillMode, implementationBackend, reviewMode, goal: goal.join(" ").trim() };
+}
+
+const MATT_PROFILES: Record<string, string> = {
+	"matt-codex-implementer": `---
+description: Codex implementation specialist for one Matt Flow ticket, including tests and commits.
+backend: codex
+thinking: high
+---
+You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.`,
+	"matt-claude-implementer": `---
+description: Claude implementation specialist for one Matt Flow ticket, including tests and commits.
+backend: claude
+model: sonnet
+thinking: high
+---
+You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.`,
+	"matt-codex-reviewer": `---
+description: Independent read-only Codex reviewer for a Standards or Spec review axis.
+backend: codex
+thinking: high
+---
+Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.`,
+	"matt-claude-reviewer": `---
+description: Independent read-only Claude reviewer for a Standards or Spec review axis.
+backend: claude
+model: sonnet
+thinking: high
+---
+Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.`,
+};
+
+function profileForImplementation(backend: AgentBackend): string | undefined {
+	return backend === "pi" ? undefined : `matt-${backend}-implementer`;
+}
+
+function profileForReview(backend: AgentBackend): string {
+	return backend === "pi" ? "general-purpose" : `matt-${backend}-reviewer`;
+}
+
+function installMattProfiles(): string[] {
+	const profileDir = join(getAgentDir(), "subagents");
+	mkdirSync(profileDir, { recursive: true });
+	const installed: string[] = [];
+	for (const [name, content] of Object.entries(MATT_PROFILES)) {
+		const path = join(profileDir, `${name}.md`);
+		if (existsSync(path)) continue;
+		writeFileSync(path, `${content.trim()}\n`, "utf8");
+		installed.push(name);
+	}
+	return installed;
 }
 
 function requiredSkills(state: Pick<FlowState, "route" | "grillMode">): string[] {
@@ -114,7 +191,7 @@ function requiredSkills(state: Pick<FlowState, "route" | "grillMode">): string[]
 		"implement",
 		"code-review",
 	];
-	if (state.route === "wayfinder") skills.push("wayfinder");
+	if (state.route === "wayfinder") skills.push("wayfinder", "research");
 	return skills;
 }
 
@@ -140,6 +217,8 @@ function formatState(state: FlowState): string {
 		`Phase: ${phaseLabel(state.phase)}`,
 		`Route: ${state.route}`,
 		`Goal: ${state.goal}`,
+		`Implementation: ${state.implementationBackend}`,
+		`Review: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}`,
 	];
 	if (state.mapRef) lines.push(`Map: ${state.mapRef}`);
 	if (state.specRef) lines.push(`Spec: ${state.specRef}`);
@@ -183,6 +262,10 @@ function updateUi(state: FlowState | undefined, ctx: ExtensionContext): void {
 	ctx.ui.setWidget(WIDGET_KEY, lines, { placement: "aboveEditor" });
 }
 
+function reviewRoutingInstructions(state: FlowState): string {
+	return `When /code-review delegates its two independent axes, use Agent subagent_type "${profileForReview(state.standardsReviewBackend)}" for Standards and "${profileForReview(state.specReviewBackend)}" for Spec. Omit session_key for both so their contexts remain fresh and isolated. Launch both Agent calls in the same assistant response.`;
+}
+
 function flowInstructions(state: FlowState): string {
 	const ticket = ticketById(state, state.activeTicketId);
 	const common = `
@@ -202,11 +285,21 @@ This is controlled by the active Matt flow (${state.flowId}). Use the installed 
 			return `/skill:to-spec ${state.mapRef ? `Use the completed Wayfinder map ${state.mapRef} and its linked decisions as the source.` : "Synthesize the shared understanding from this conversation."}\n\nAfter the spec is published to the configured tracker, call matt_flow with action "phase_complete" and artifact set to its canonical URL/id/path.${common}`;
 		case "tickets":
 			return `/skill:to-tickets ${state.specRef ?? ""}\n\nAfter the user approves the breakdown and every ticket is published, call matt_flow with action "tickets_created". Supply every created ticket in dependency order with its canonical id/path, title, and blockedBy containing exact ids from the same list. Do not include the parent spec as a ticket.${common}`;
-		case "implement":
+		case "implement": {
 			if (!ticket) throw new Error("The implementation phase has no active ticket");
-			return `/skill:implement ${ticket.id}\n\nImplement only this ticket: ${ticket.title}. Fetch its complete tracker body and comments. Its fixed review point is ${ticket.baseline}. Use TDD at the agreed seams, run focused checks regularly, then the full suite. Run /code-review against ${ticket.baseline}, fix every valid Standards and Spec finding, and re-check. Commit the finished work, close/update the ticket in the configured tracker so blockers can advance, ensure the worktree is clean, then call matt_flow with action "ticket_implemented", ticketId "${ticket.id}", and commitSha set to HEAD. Do not begin another ticket in this session.${common}`;
-		case "review":
-			return `/skill:code-review ${state.baseRef}\n\nThis is the final integration review for the entire flow. Use spec ${state.specRef ?? "(discover from the tickets)"} and tickets ${state.tickets.map((item) => item.id).join(", ")}. Review the diff from ${state.baseRef} through HEAD on both axes. Fix every valid finding, run the full verification suite, commit fixes, and repeat the two-axis review until no actionable findings remain. Ensure the worktree is clean, then call matt_flow with action "review_complete" and a concise summary.${common}`;
+			const implementer = profileForImplementation(state.implementationBackend);
+			const execution = implementer
+				? `Delegate all implementation edits to Agent subagent_type "${implementer}" with session_key "${state.flowId}-${ticket.id}-implementation". Give the first call a self-contained briefing containing the complete ticket, fixed point ${ticket.baseline}, acceptance criteria, agreed seams, TDD requirement, and focused verification commands; explicitly tell it not to commit or update the tracker yet. The coordinator must inspect the resulting diff and run the independent review axes. Then continue the same session_key with all valid findings (or confirmation that none were found), asking it to fix findings, run the full suite, commit, and update/close the tracker ticket. The coordinator verifies the final diff, commit, tracker state, and clean worktree; it must not duplicate the implementation itself.`
+				: "Implement directly in this fresh Pi coordinator session.";
+			return `/skill:implement ${ticket.id}\n\nImplement only this ticket: ${ticket.title}. Fetch its complete tracker body and comments. ${execution} Its fixed review point is ${ticket.baseline}. Use TDD at the agreed seams, run focused checks regularly, then the full suite. ${reviewRoutingInstructions(state)} Run /code-review against ${ticket.baseline}, fix every valid Standards and Spec finding, and re-check. Commit the finished work, close/update the ticket in the configured tracker so blockers can advance, ensure the worktree is clean, then call matt_flow with action "ticket_implemented", ticketId "${ticket.id}", and commitSha set to HEAD. Do not begin another ticket in this session.${common}`;
+		}
+		case "review": {
+			const implementer = profileForImplementation(state.implementationBackend);
+			const fixes = implementer
+				? `Delegate integration fixes to Agent subagent_type "${implementer}" with session_key "${state.flowId}-integration-fixes", then verify its diff and commits.`
+				: "Apply integration fixes directly in this coordinator session.";
+			return `/skill:code-review ${state.baseRef}\n\nThis is the final integration review for the entire flow. Use spec ${state.specRef ?? "(discover from the tickets)"} and tickets ${state.tickets.map((item) => item.id).join(", ")}. ${reviewRoutingInstructions(state)} Review the diff from ${state.baseRef} through HEAD on both axes. ${fixes} Fix every valid finding, run the full verification suite, commit fixes, and repeat the two-axis review until no actionable findings remain. Ensure the worktree is clean, then call matt_flow with action "review_complete" and a concise summary.${common}`;
+		}
 		default:
 			throw new Error(`No kickoff exists for phase ${state.phase}`);
 	}
@@ -219,106 +312,24 @@ Flow id: ${state.flowId}
 Current phase: ${state.phase}
 Route: ${state.route}
 Goal: ${state.goal}
+Implementation backend: ${state.implementationBackend}
+Review backends: Standards=${state.standardsReviewBackend}, Spec=${state.specReviewBackend}
 ${state.specRef ? `Spec: ${state.specRef}\n` : ""}${ticket ? `Active ticket: ${ticket.id} — ${ticket.title}\nTicket fixed point: ${ticket.baseline}\n` : ""}
 Rules:
 - Follow the current Matt skill and all of its user-confirmation gates.
+- ${reviewRoutingInstructions(state)}
+- When an external implementation Agent is configured, let it make the edits; the coordinator verifies, reviews, and advances the flow.
 - Stay in the current phase; never start a later phase or another implementation ticket yourself.
 - Report durable tracker identifiers to matt_flow rather than merely mentioning them in prose.
 - A ticket is not implemented until review findings are fixed, tests pass, it is committed, its tracker status is updated, and the worktree is clean.
 - If blocked, call matt_flow action "pause" with a reason instead of pretending the phase completed.`;
 }
 
-function truncateUtf8(text: string, maxBytes: number): string {
-	if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-	let end = Math.min(text.length, maxBytes);
-	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > maxBytes) end--;
-	return `${text.slice(0, end)}\n\n[Agent output truncated to ${maxBytes} bytes]`;
-}
-
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
-	const currentScript = process.argv[1];
-	const bunVirtual = currentScript?.startsWith("/$bunfs/root/");
-	if (currentScript && !bunVirtual && existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
-	}
-	const executable = basename(process.execPath).toLowerCase();
-	if (!/^(node|bun)(\.exe)?$/.test(executable)) return { command: process.execPath, args };
-	return { command: "pi", args };
-}
-
-async function runReviewAgent(
-	prompt: string,
-	ctx: ExtensionContext,
-	signal: AbortSignal | undefined,
-): Promise<string> {
-	const args = ["--mode", "json", "-p", "--no-session", "--no-extensions", "--approve", "--tools", "read,bash"];
-	if (ctx.model) args.push("--provider", ctx.model.provider, "--model", ctx.model.id);
-	if (ctx.thinkingLevel) args.push("--thinking", ctx.thinkingLevel);
-	args.push(prompt);
-
-	const invocation = getPiInvocation(args);
-	return new Promise<string>((resolve, reject) => {
-		const child = spawn(invocation.command, invocation.args, {
-			cwd: ctx.cwd,
-			env: { ...process.env },
-			stdio: ["ignore", "pipe", "pipe"],
-		});
-		let stdoutBuffer = "";
-		let stderr = "";
-		let finalText = "";
-		let aborted = false;
-
-		const consumeLine = (line: string) => {
-			if (!line.trim()) return;
-			try {
-				const event = JSON.parse(line) as {
-					type?: string;
-					message?: { role?: string; content?: string | Array<{ type?: string; text?: string }>; errorMessage?: string };
-				};
-				if (event.type !== "message_end" || event.message?.role !== "assistant") return;
-				if (typeof event.message.content === "string") finalText = event.message.content;
-				else if (Array.isArray(event.message.content)) {
-					const text = event.message.content
-						.filter((part) => part.type === "text" && typeof part.text === "string")
-						.map((part) => part.text)
-						.join("\n");
-					if (text) finalText = text;
-				}
-				if (event.message.errorMessage) stderr += `\n${event.message.errorMessage}`;
-			} catch {
-				// Ignore non-JSON diagnostics; pi's JSON mode is line-delimited.
-			}
-		};
-
-		child.stdout.on("data", (chunk) => {
-			stdoutBuffer += chunk.toString();
-			const lines = stdoutBuffer.split("\n");
-			stdoutBuffer = lines.pop() ?? "";
-			for (const line of lines) consumeLine(line);
-		});
-		child.stderr.on("data", (chunk) => {
-			stderr += chunk.toString();
-		});
-		child.on("error", reject);
-		child.on("close", (code) => {
-			if (stdoutBuffer.trim()) consumeLine(stdoutBuffer);
-			if (aborted) return reject(new Error("Agent sub-process was aborted"));
-			if (code !== 0) return reject(new Error(`Agent exited with code ${code}: ${stderr.trim() || "no diagnostic"}`));
-			if (!finalText.trim()) return reject(new Error(`Agent returned no final text: ${stderr.trim() || "no diagnostic"}`));
-			resolve(truncateUtf8(finalText, MAX_AGENT_OUTPUT_BYTES));
-		});
-
-		const abort = () => {
-			aborted = true;
-			child.kill("SIGTERM");
-			setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
-		};
-		if (signal?.aborted) abort();
-		else signal?.addEventListener("abort", abort, { once: true });
-	});
-}
-
 export default function mattFlowExtension(pi: ExtensionAPI): void {
+	// pi-flow owns the subagent seam: Agent, multi-backend profiles, concurrency,
+	// session_key continuation, telemetry, and optional trusted workflows.
+	createFlowExtension({ workflow: true })(pi);
+
 	let state: FlowState | undefined;
 
 	const persist = (ctx?: ExtensionContext) => {
@@ -333,7 +344,18 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			.getBranch()
 			.filter((item) => item.type === "custom" && item.customType === STATE_ENTRY)
 			.pop() as { data?: FlowState } | undefined;
-		state = entry?.data ? cloneState(entry.data) : undefined;
+		if (entry?.data) {
+			const restored = cloneState(entry.data);
+			state = {
+				...restored,
+				version: 2,
+				implementationBackend: restored.implementationBackend ?? "pi",
+				standardsReviewBackend: restored.standardsReviewBackend ?? "pi",
+				specReviewBackend: restored.specReviewBackend ?? "pi",
+			};
+		} else {
+			state = undefined;
+		}
 		updateUi(state, ctx);
 	};
 
@@ -401,27 +423,6 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		});
 		if (result.cancelled) ctx.ui.notify("Matt flow session transition was cancelled", "warning");
 	};
-
-	pi.registerTool({
-		name: "Agent",
-		label: "Agent",
-		description: "Run an isolated general-purpose sub-agent. Multiple Agent calls in one assistant message execute in parallel. Intended for Matt's code-review skill.",
-		promptSnippet: "Run isolated general-purpose sub-agents for parallel review work",
-		parameters: Type.Object({
-			description: Type.Optional(Type.String({ description: "Short label for the delegated task" })),
-			prompt: Type.String({ description: "Complete task instructions for the sub-agent" }),
-			subagent_type: Type.Optional(Type.String({ description: "Agent type; general-purpose is supported" })),
-		}),
-		executionMode: "parallel",
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			onUpdate?.({
-				content: [{ type: "text", text: `Running ${params.description || params.subagent_type || "agent"}…` }],
-				details: {},
-			});
-			const output = await runReviewAgent(params.prompt, ctx, signal);
-			return { content: [{ type: "text", text: output }], details: { description: params.description } };
-		},
-	});
 
 	const TicketInput = Type.Object({
 		id: Type.String({ description: "Canonical tracker id, URL, or local ticket path" }),
@@ -568,7 +569,13 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				if (!replace) return;
 			}
 
-			const parsed = parseStartArgs(rawArgs);
+			let parsed: ParsedStartArgs;
+			try {
+				parsed = parseStartArgs(rawArgs);
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+				return;
+			}
 			const rootResult = await pi.exec("git", ["-C", ctx.cwd, "rev-parse", "--show-toplevel"]);
 			if (rootResult.code !== 0) {
 				ctx.ui.notify("Matt's ship flow must be started inside a git repository", "error");
@@ -579,7 +586,10 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			let goal = parsed.goal;
 			if (!goal && ctx.hasUI) goal = (await ctx.ui.editor("What idea should this flow take to shipped code?", ""))?.trim() ?? "";
 			if (!goal) {
-				ctx.ui.notify("Usage: /matt-flow [--main|--wayfinder] [--docs|--grill-me] <idea>", "warning");
+				ctx.ui.notify(
+					"Usage: /matt-flow [--main|--wayfinder] [--docs|--grill-me] [--implement-with pi|codex|claude] [--review-with pi|codex|claude|cross] <idea>",
+					"warning",
+				);
 				return;
 			}
 
@@ -605,6 +615,62 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			}
 			grillMode ??= "grill-with-docs";
 
+			let implementationBackend = parsed.implementationBackend;
+			if (!implementationBackend && ctx.hasUI) {
+				const choice = await ctx.ui.select("Who should implement each ticket?", [
+					"Pi coordinator — implement directly in each fresh session (recommended)",
+					"Codex CLI — delegate edits through pi-flow",
+					"Claude Code — delegate edits through pi-flow",
+				]);
+				if (!choice) return;
+				implementationBackend = choice.startsWith("Codex") ? "codex" : choice.startsWith("Claude") ? "claude" : "pi";
+			}
+			implementationBackend ??= "pi";
+
+			let reviewMode = parsed.reviewMode;
+			if (!reviewMode && ctx.hasUI) {
+				const choice = await ctx.ui.select("Who should run the independent review axes?", [
+					"Cross review — Codex for Standards, Claude for Spec (recommended)",
+					"Pi subagents — Pi for both axes",
+					"Codex CLI — Codex for both axes",
+					"Claude Code — Claude for both axes",
+				]);
+				if (!choice) return;
+				reviewMode = choice.startsWith("Cross")
+					? "cross"
+					: choice.startsWith("Codex")
+						? "codex"
+						: choice.startsWith("Claude")
+							? "claude"
+							: "pi";
+			}
+			reviewMode ??= "pi";
+			const standardsReviewBackend: AgentBackend = reviewMode === "cross" ? "codex" : reviewMode;
+			const specReviewBackend: AgentBackend = reviewMode === "cross" ? "claude" : reviewMode;
+
+			const externalBackends = new Set(
+				[implementationBackend, standardsReviewBackend, specReviewBackend].filter(
+					(backend): backend is Exclude<AgentBackend, "pi"> => backend !== "pi",
+				),
+			);
+			for (const backend of externalBackends) {
+				const check = await pi.exec(backend === "codex" ? "codex" : "claude", ["--version"]);
+				if (check.code !== 0) {
+					ctx.ui.notify(`${backend === "codex" ? "Codex CLI" : "Claude Code"} is not available on PATH`, "error");
+					return;
+				}
+			}
+			if (externalBackends.size > 0) {
+				const installedProfiles = installMattProfiles();
+				if (installedProfiles.length > 0) {
+					ctx.ui.notify(`Installed pi-flow profiles: ${installedProfiles.join(", ")}`, "info");
+				}
+				ctx.ui.notify(
+					"External pi-flow backends bypass normal approval/sandbox prompts. Continue only in a trusted repository.",
+					"warning",
+				);
+			}
+
 			const headResult = await pi.exec("git", ["-C", repoRoot, "rev-parse", "HEAD"]);
 			if (headResult.code !== 0) {
 				ctx.ui.notify("The repository needs an initial commit before this workflow can review fixed-point diffs", "error");
@@ -617,22 +683,19 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				ctx.ui.notify(`Missing required skills: ${missing.join(", ")}`, "error");
 				return;
 			}
-			if (route === "wayfinder" && !skillIsAvailable(pi, "research")) {
-				ctx.ui.notify(
-					"The optional /research skill is not installed. Wayfinder can still chart and resolve non-research tickets, but research tickets must be handled manually or after installing that skill.",
-					"warning",
-				);
-			}
 
 			const setupExists = existsSync(join(repoRoot, "docs", "agents", "issue-tracker.md"));
 			const now = new Date().toISOString();
 			state = {
-				version: 1,
+				version: 2,
 				flowId: Math.random().toString(36).slice(2, 8),
 				goal,
 				repoRoot,
 				route,
 				grillMode,
+				implementationBackend,
+				standardsReviewBackend,
+				specReviewBackend,
 				phase: setupExists ? (route === "wayfinder" ? "wayfinder-chart" : "grill") : "setup",
 				baseRef: headResult.stdout.trim(),
 				tickets: [],
@@ -642,6 +705,17 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			pi.setSessionName(`matt:${state.phase} ${goal.slice(0, 50)}`);
 			persist(ctx);
 			pi.sendUserMessage(flowInstructions(state));
+		},
+	});
+
+	pi.registerCommand("matt-flow-install-profiles", {
+		description: "Install the bundled Codex and Claude pi-flow profiles without overwriting existing profiles",
+		handler: async (_args, ctx) => {
+			const installed = installMattProfiles();
+			ctx.ui.notify(
+				installed.length > 0 ? `Installed pi-flow profiles: ${installed.join(", ")}` : "Matt pi-flow profiles are already installed",
+				"info",
+			);
 		},
 	});
 

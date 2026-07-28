@@ -1,6 +1,6 @@
 # Matt Flow for pi
 
-A pi package that turns Matt Pocock's engineering skills into a resumable idea-to-ship state machine.
+A pi package that turns Matt Pocock's engineering skills into a resumable idea-to-ship state machine, with [pi-flow](https://github.com/kky42/pi-flow) providing fresh Pi, Codex CLI, and Claude Code subagents.
 
 ## Install
 
@@ -18,7 +18,16 @@ Then restart pi, or run `/reload` in an existing process.
 
 ### Prerequisites
 
-Install [Matt Pocock's skills](https://github.com/mattpocock/skills), including `setup-matt-pocock-skills`, `grill-with-docs` or `grill-me`, `to-spec`, `to-tickets`, `implement`, and `code-review`. The `wayfinder` route additionally requires the `wayfinder` skill.
+Install [Matt Pocock's skills](https://github.com/mattpocock/skills), including `setup-matt-pocock-skills`, `grill-with-docs` or `grill-me`, `to-spec`, `to-tickets`, `implement`, and `code-review`. The `wayfinder` route additionally requires `wayfinder` and `research`.
+
+`@kky42/pi-flow` is bundled by this package. Do not install a second standalone copy, because both copies would register `Agent` and `workflow` tools.
+
+For external backends, install and authenticate the corresponding CLI:
+
+```bash
+codex login
+claude auth login
+```
 
 ## Start
 
@@ -26,6 +35,8 @@ Install [Matt Pocock's skills](https://github.com/mattpocock/skills), including 
 /matt-flow Build project-scoped API tokens
 /matt-flow --main --docs Build project-scoped API tokens
 /matt-flow --wayfinder Redesign the platform's authorization model
+/matt-flow --implement-with codex --review-with cross Build project-scoped API tokens
+/matt-flow --implement-with claude --review-with codex Build project-scoped API tokens
 ```
 
 Without flags, the command asks which Ask Matt route to use:
@@ -43,9 +54,8 @@ The extension follows `ask-matt` and `wayfinder` context hygiene:
 - Every implementation ticket starts in a **new pi session** and receives only the durable workflow state and that ticket's tracker id.
 - Every Wayfinder decision ticket starts in a **new pi session**; no session resolves more than one.
 - The final integration review starts in a **new pi session**.
-- Each Standards/Spec review axis runs as a separate ephemeral `pi --no-session` subprocess through the included `Agent` compatibility tool. Parallel `Agent` calls therefore have isolated context windows.
-
-The installed Matt bundle currently has no `/research` skill. Wayfinder remains usable for non-research decision tickets and warns on startup; install `/research` separately before relying on Wayfinder's automatic research-ticket branch flow.
+- Each Standards/Spec review axis runs as a separate fresh pi-flow `Agent` call with no `session_key`, so the axes remain isolated.
+- A Codex or Claude implementation agent gets a stable per-ticket `session_key`; review fixes continue that same specialist context without contaminating independent review contexts.
 
 The implementation ticket's fixed point is captured immediately before its fresh session. The final review fixed point is the commit at which `/matt-flow` started.
 
@@ -61,6 +71,27 @@ Flags:
 
 - `--main` / `--wayfinder`
 - `--docs` / `--grill-me`
+- `--implement-with pi|codex|claude`
+- `--review-with pi|codex|claude|cross`
+
+`cross` assigns Standards review to Codex and Spec review to Claude. Without flags, the interactive command asks for both choices.
+
+## pi-flow integration
+
+Matt Flow owns the phase state machine and interactive fresh-session boundaries. pi-flow owns the subagent seam: profiles, Pi/Codex/Claude spawning, bounded concurrency, cancellation, telemetry, rendering, and `session_key` continuation.
+
+When an external backend is selected, Matt Flow installs these profiles under `~/.pi/agent/subagents/` if they are missing, without overwriting existing files:
+
+- `matt-codex-implementer`
+- `matt-claude-implementer`
+- `matt-codex-reviewer`
+- `matt-claude-reviewer`
+
+Run `/matt-flow-install-profiles` to install them explicitly.
+
+The bundled pi-flow `workflow` tool is also available for additional trusted, read-only fan-out. Matt Flow does not use it for its main state machine because grilling, Wayfinder decisions, and ticket progression contain human gates and cross-session transitions.
+
+> **Security:** pi-flow runs Codex and Claude external backends with their approval/sandbox checks bypassed. Use external implementation agents only in repositories you trust. Review profiles are instructed to remain read-only, but they still run through those privileged CLIs.
 
 ## Milestone tool
 

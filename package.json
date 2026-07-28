@@ -1,6 +1,6 @@
 {
   "name": "pi-matt-flow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A resumable idea-to-ship workflow for pi using Matt Pocock's engineering skills",
   "type": "module",
   "license": "MIT",
@@ -18,7 +18,9 @@
     "code-review"
   ],
   "scripts": {
-    "check": "pi --offline --no-extensions -e ./extensions/matt-flow/index.ts --list-models >/dev/null"
+    "check": "npm run typecheck && npm run smoke",
+    "typecheck": "tsc --noEmit",
+    "smoke": "pi --offline --no-extensions -e ./extensions/matt-flow/index.ts --list-models >/dev/null"
   },
   "pi": {
     "extensions": [
@@ -29,5 +31,15 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
+  },
+  "dependencies": {
+    "@kky42/pi-flow": "2.1.3"
+  },
+  "bundledDependencies": [
+    "@kky42/pi-flow"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3"
   }
 }
