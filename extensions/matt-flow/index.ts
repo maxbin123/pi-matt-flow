@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createFlowExtension } from "@kky42/pi-flow";
 import {
@@ -132,41 +133,67 @@ function parseStartArgs(raw: string): ParsedStartArgs {
 	return { route, grillMode, implementationBackend, reviewMode, goal: goal.join(" ").trim() };
 }
 
-const MATT_PROFILES: Record<string, string> = {
-	"matt-codex-implementer": `---
-description: Codex implementation specialist for one Matt Flow ticket, including tests and commits.
-backend: codex
-thinking: high
----
-You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.`,
-	"matt-claude-implementer": `---
-description: Claude implementation specialist for one Matt Flow ticket, including tests and commits.
-backend: claude
-model: sonnet
-thinking: high
----
-You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.`,
-	"matt-codex-reviewer": `---
-description: Independent read-only Codex reviewer for a Standards or Spec review axis.
-backend: codex
-thinking: high
----
-Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.`,
-	"matt-claude-reviewer": `---
-description: Independent read-only Claude reviewer for a Standards or Spec review axis.
-backend: claude
-model: sonnet
-thinking: high
----
-Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.`,
+interface BackendInfo {
+	label: string;
+	command?: string;
+	model?: string;
+	implementationProfile?: string;
+	reviewProfile: string;
+}
+
+const BACKENDS: Record<AgentBackend, BackendInfo> = {
+	pi: {
+		label: "Pi",
+		reviewProfile: "matt-pi-reviewer",
+	},
+	codex: {
+		label: "Codex CLI",
+		command: "codex",
+		implementationProfile: "matt-codex-implementer",
+		reviewProfile: "matt-codex-reviewer",
+	},
+	claude: {
+		label: "Claude Code",
+		command: "claude",
+		model: "sonnet",
+		implementationProfile: "matt-claude-implementer",
+		reviewProfile: "matt-claude-reviewer",
+	},
 };
 
+const IMPLEMENTER_ROLE = "You are the implementation specialist in a Matt Flow. Work only on the ticket in the task briefing. Inspect the repository and tracker context, implement test-first at the stated seams, and run the requested checks. Commit and update the tracker only when the coordinator's task explicitly asks you to. Do not delegate. Do not broaden scope. Report changes, tests, commits, and blockers precisely.";
+const REVIEWER_ROLE = "Act only as a read-only reviewer. Never edit files, commit, or fix findings. Follow the supplied review-axis brief exactly, cite concrete evidence, and return concise findings to the coordinator.";
+
+function buildProfile(backend: Exclude<AgentBackend, "pi">, role: "implementer" | "reviewer"): [string, string] {
+	const info = BACKENDS[backend];
+	const name = role === "implementer" ? info.implementationProfile! : info.reviewProfile;
+	const description = role === "implementer"
+		? `${info.label} implementation specialist for one Matt Flow ticket, including tests and commits.`
+		: `Independent read-only ${info.label} reviewer for a Standards or Spec review axis.`;
+	const model = info.model ? `\nmodel: ${info.model}` : "";
+	return [
+		name,
+		`---\ndescription: ${description}\nbackend: ${backend}${model}\nthinking: high\n---\n${role === "implementer" ? IMPLEMENTER_ROLE : REVIEWER_ROLE}`,
+	];
+}
+
+const MATT_PROFILES: Record<string, string> = Object.fromEntries([
+	[
+		"matt-pi-reviewer",
+		`---\ndescription: Independent read-only Pi reviewer for a Standards or Spec review axis.\nbackend: pi\ntools: read, bash, grep, find, ls\nthinking: high\n---\n${REVIEWER_ROLE}`,
+	],
+	...(["codex", "claude"] as const).flatMap((backend) => [
+		buildProfile(backend, "implementer"),
+		buildProfile(backend, "reviewer"),
+	]),
+]);
+
 function profileForImplementation(backend: AgentBackend): string | undefined {
-	return backend === "pi" ? undefined : `matt-${backend}-implementer`;
+	return BACKENDS[backend].implementationProfile;
 }
 
 function profileForReview(backend: AgentBackend): string {
-	return backend === "pi" ? "general-purpose" : `matt-${backend}-reviewer`;
+	return BACKENDS[backend].reviewProfile;
 }
 
 function installMattProfiles(): string[] {
@@ -327,10 +354,13 @@ Rules:
 
 export default function mattFlowExtension(pi: ExtensionAPI): void {
 	// pi-flow owns the subagent seam: Agent, multi-backend profiles, concurrency,
-	// session_key continuation, telemetry, and optional trusted workflows.
-	createFlowExtension({ workflow: true })(pi);
+	// session_key continuation, telemetry, and rendering. Matt Flow intentionally
+	// keeps pi-flow's dynamic workflow tool disabled: its own human-gated state
+	// machine is the orchestration interface.
+	createFlowExtension({ workflow: false })(pi);
 
 	let state: FlowState | undefined;
+	const reviewWorktreeFingerprints = new Map<string, { cwd: string; fingerprint: string }>();
 
 	const persist = (ctx?: ExtensionContext) => {
 		if (!state) return;
@@ -382,6 +412,28 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		const result = await pi.exec("git", ["-C", state.repoRoot, "rev-parse", "HEAD"]);
 		if (result.code !== 0) throw new Error(result.stderr || "Unable to resolve HEAD");
 		return result.stdout.trim();
+	};
+
+	const fingerprintWorktree = async (cwd: string): Promise<string> => {
+		const [head, diff, untracked] = await Promise.all([
+			pi.exec("git", ["-C", cwd, "rev-parse", "HEAD"]),
+			pi.exec("git", ["-C", cwd, "diff", "HEAD", "--binary", "--no-ext-diff"]),
+			pi.exec("git", ["-C", cwd, "ls-files", "--others", "--exclude-standard", "-z"]),
+		]);
+		if (head.code !== 0 || diff.code !== 0 || untracked.code !== 0) {
+			throw new Error(head.stderr || diff.stderr || untracked.stderr || "Unable to fingerprint the review worktree");
+		}
+		const hash = createHash("sha256").update(head.stdout).update("\0").update(diff.stdout);
+		const paths = untracked.stdout.split("\0").filter(Boolean).sort();
+		for (const relativePath of paths) {
+			hash.update("\0").update(relativePath).update("\0");
+			try {
+				hash.update(readFileSync(join(cwd, relativePath)));
+			} catch {
+				hash.update("<unreadable-or-removed>");
+			}
+		}
+		return hash.digest("hex");
 	};
 
 	const startFreshPhase = async (ctx: ExtensionCommandContext): Promise<void> => {
@@ -617,32 +669,28 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 
 			let implementationBackend = parsed.implementationBackend;
 			if (!implementationBackend && ctx.hasUI) {
-				const choice = await ctx.ui.select("Who should implement each ticket?", [
-					"Pi coordinator — implement directly in each fresh session (recommended)",
-					"Codex CLI — delegate edits through pi-flow",
-					"Claude Code — delegate edits through pi-flow",
-				]);
+				const options: Array<[AgentBackend, string]> = [
+					["pi", "Pi coordinator — implement directly in each fresh session (recommended)"],
+					["codex", "Codex CLI — delegate edits through pi-flow"],
+					["claude", "Claude Code — delegate edits through pi-flow"],
+				];
+				const choice = await ctx.ui.select("Who should implement each ticket?", options.map(([, label]) => label));
 				if (!choice) return;
-				implementationBackend = choice.startsWith("Codex") ? "codex" : choice.startsWith("Claude") ? "claude" : "pi";
+				implementationBackend = options.find(([, label]) => label === choice)?.[0];
 			}
 			implementationBackend ??= "pi";
 
 			let reviewMode = parsed.reviewMode;
 			if (!reviewMode && ctx.hasUI) {
-				const choice = await ctx.ui.select("Who should run the independent review axes?", [
-					"Cross review — Codex for Standards, Claude for Spec (recommended)",
-					"Pi subagents — Pi for both axes",
-					"Codex CLI — Codex for both axes",
-					"Claude Code — Claude for both axes",
-				]);
+				const options: Array<[AgentBackend | "cross", string]> = [
+					["cross", "Cross review — Codex for Standards, Claude for Spec (recommended)"],
+					["pi", "Pi subagents — Pi for both axes"],
+					["codex", "Codex CLI — Codex for both axes"],
+					["claude", "Claude Code — Claude for both axes"],
+				];
+				const choice = await ctx.ui.select("Who should run the independent review axes?", options.map(([, label]) => label));
 				if (!choice) return;
-				reviewMode = choice.startsWith("Cross")
-					? "cross"
-					: choice.startsWith("Codex")
-						? "codex"
-						: choice.startsWith("Claude")
-							? "claude"
-							: "pi";
+				reviewMode = options.find(([, label]) => label === choice)?.[0];
 			}
 			reviewMode ??= "pi";
 			const standardsReviewBackend: AgentBackend = reviewMode === "cross" ? "codex" : reviewMode;
@@ -654,9 +702,10 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 				),
 			);
 			for (const backend of externalBackends) {
-				const check = await pi.exec(backend === "codex" ? "codex" : "claude", ["--version"]);
+				const info = BACKENDS[backend];
+				const check = await pi.exec(info.command!, ["--version"]);
 				if (check.code !== 0) {
-					ctx.ui.notify(`${backend === "codex" ? "Codex CLI" : "Claude Code"} is not available on PATH`, "error");
+					ctx.ui.notify(`${info.label} is not available on PATH`, "error");
 					return;
 				}
 			}
@@ -763,6 +812,34 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 			await ctx.waitForIdle();
 			await startFreshPhase(ctx);
 		},
+	});
+
+	pi.on("tool_call", async (event, ctx) => {
+		if (event.toolName !== "Agent") return;
+		const subagentType = (event.input as { subagent_type?: unknown }).subagent_type;
+		if (!Object.values(BACKENDS).some((backend) => backend.reviewProfile === subagentType)) return;
+		reviewWorktreeFingerprints.set(event.toolCallId, {
+			cwd: ctx.cwd,
+			fingerprint: await fingerprintWorktree(ctx.cwd),
+		});
+	});
+
+	pi.on("tool_result", async (event) => {
+		const baseline = reviewWorktreeFingerprints.get(event.toolCallId);
+		if (!baseline) return;
+		reviewWorktreeFingerprints.delete(event.toolCallId);
+		const current = await fingerprintWorktree(baseline.cwd);
+		if (current === baseline.fingerprint) return;
+		return {
+			content: [
+				...event.content,
+				{
+					type: "text" as const,
+					text: "REVIEW SAFETY FAILURE: the worktree changed during this read-only review. Inspect and restore or intentionally incorporate the changes before advancing the Matt flow.",
+				},
+			],
+			isError: true,
+		};
 	});
 
 	pi.on("before_agent_start", async (event) => {

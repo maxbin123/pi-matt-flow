@@ -20,7 +20,7 @@ Then restart pi, or run `/reload` in an existing process.
 
 Install [Matt Pocock's skills](https://github.com/mattpocock/skills), including `setup-matt-pocock-skills`, `grill-with-docs` or `grill-me`, `to-spec`, `to-tickets`, `implement`, and `code-review`. The `wayfinder` route additionally requires `wayfinder` and `research`.
 
-`@kky42/pi-flow` is bundled by this package. Do not install a second standalone copy, because both copies would register `Agent` and `workflow` tools.
+`@kky42/pi-flow` is bundled by this package. Do not install a second standalone copy, because both copies would register the `Agent` tool.
 
 For external backends, install and authenticate the corresponding CLI:
 
@@ -82,6 +82,7 @@ Matt Flow owns the phase state machine and interactive fresh-session boundaries.
 
 When an external backend is selected, Matt Flow installs these profiles under `~/.pi/agent/subagents/` if they are missing, without overwriting existing files:
 
+- `matt-pi-reviewer`
 - `matt-codex-implementer`
 - `matt-claude-implementer`
 - `matt-codex-reviewer`
@@ -89,9 +90,9 @@ When an external backend is selected, Matt Flow installs these profiles under `~
 
 Run `/matt-flow-install-profiles` to install them explicitly.
 
-The bundled pi-flow `workflow` tool is also available for additional trusted, read-only fan-out. Matt Flow does not use it for its main state machine because grilling, Wayfinder decisions, and ticket progression contain human gates and cross-session transitions.
+Matt Flow deliberately disables pi-flow's dynamic `workflow` tool. Its main flow contains human gates and cross-session transitions, while direct parallel `Agent` calls already provide the fresh-context implementation and review delegation it needs.
 
-> **Security:** pi-flow runs Codex and Claude external backends with their approval/sandbox checks bypassed. Use external implementation agents only in repositories you trust. Review profiles are instructed to remain read-only, but they still run through those privileged CLIs.
+> **Security:** pi-flow runs Codex and Claude external backends with their approval/sandbox checks bypassed. Use external implementation agents only in repositories you trust. Review profiles are instructed to remain read-only, and Matt Flow fingerprints the worktree before and after review calls so an attempted review mutation fails the tool call, but the external CLIs still run with privileged access.
 
 ## Milestone tool
 
