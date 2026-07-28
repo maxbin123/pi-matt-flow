@@ -397,6 +397,7 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 	const reviewWorktreeFingerprints = new Map<string, { cwd: string; fingerprint: string }>();
 	const reviewCallLanes = new Map<string, CrossReviewLaneKey>();
 	const completedCrossReviewLanes = new Set<CrossReviewLaneKey>();
+	let completedCrossReviewScope: string | undefined;
 
 	const persist = (ctx?: ExtensionContext) => {
 		if (!state) return;
@@ -482,9 +483,16 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		return hash.digest("hex");
 	};
 
+	const currentReviewScope = (): string | undefined => state
+		? `${state.flowId}:${state.phase}:${state.activeTicketId ?? state.baseRef}`
+		: undefined;
+
 	const assertCrossReviewCompleted = (): void => {
 		if (state?.reviewRouting.mode !== "cross") return;
-		const missing = CROSS_REVIEW_LANES.filter((lane) => !completedCrossReviewLanes.has(lane.key));
+		const scope = currentReviewScope();
+		const missing = completedCrossReviewScope === scope
+			? CROSS_REVIEW_LANES.filter((lane) => !completedCrossReviewLanes.has(lane.key))
+			: [...CROSS_REVIEW_LANES];
 		if (missing.length > 0) {
 			throw new Error(`Four-way cross review is incomplete. Missing: ${missing.map((lane) => lane.description).join(", ")}`);
 		}
@@ -916,6 +924,11 @@ export default function mattFlowExtension(pi: ExtensionAPI): void {
 		}
 
 		if (state?.reviewRouting.mode === "cross") {
+			const scope = currentReviewScope();
+			if (completedCrossReviewScope !== scope) {
+				completedCrossReviewLanes.clear();
+				completedCrossReviewScope = scope;
+			}
 			const assistantEntry = [...ctx.sessionManager.getBranch()].reverse().find(
 				(entry) => entry.type === "message" && entry.message.role === "assistant" && entry.message.content.some(
 					(part) => part.type === "toolCall" && part.id === event.toolCallId,
